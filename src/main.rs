@@ -2,8 +2,8 @@ use std::env::{var, VarError};
 use std::io::stdin;
 use std::process::Command;
 use std::sync::{
-    mpsc::{channel, sync_channel, Receiver, Sender},
-    Arc, Barrier, LockResult, Mutex,
+    mpsc::{channel, Receiver, Sender},
+    Arc, Barrier,
 };
 use std::thread::sleep;
 use std::time::Duration;
@@ -45,47 +45,42 @@ fn get_threads(args: Args) -> Option<usize> {
 
 #[derive(Debug)]
 enum Signal {
-    NextCommand,
-    EndThread,
+    NextCommand(usize),
+    EndThread(usize),
 }
 
 fn thread_function(
     thread_index: usize,
     barrier: Arc<Barrier>,
     req_tx: Sender<Signal>,
-    command_rx: Arc<Mutex<Receiver<Option<String>>>>,
+    command_rx: Receiver<Option<String>>,
 ) {
     barrier.wait();
     loop {
         // ping main thread for next command
-        println!("Thread {thread_index}) request command");
-        req_tx.send(Signal::NextCommand).unwrap();
+        req_tx.send(Signal::NextCommand(thread_index)).unwrap();
         // wait for next command
-        match command_rx.lock() {
-            LockResult::Ok(rx) => match rx.recv() {
-                Ok(command_opt) => {
-                    if let Some(command) = command_opt {
-                        println!("Thread {thread_index}) running");
-                        let r = Command::new("sh")
-                            .arg("-c")
-                            .arg(command)
-                            .env("THREAD_INDEX", format!("{thread_index}"))
-                            .status();
-                        if let Err(e) = r {
-                            println!("Error on process: {e}");
-                            break;
-                        }
-                    } else {
+        match command_rx.recv() {
+            Ok(command_opt) => {
+                if let Some(command) = command_opt {
+                    let r = Command::new("sh")
+                        .arg("-c")
+                        .arg(command)
+                        .env("THREAD_INDEX", format!("{thread_index}"))
+                        .status();
+                    if let Err(e) = r {
+                        println!("Error on process: {e}");
                         break;
                     }
+                } else {
+                    break;
                 }
-                Err(_) => break,
-            },
-            LockResult::Err(_) => break,
+            }
+            Err(_) => break,
         }
         sleep(Duration::from_millis(10));
     }
-    req_tx.send(Signal::EndThread).unwrap();
+    req_tx.send(Signal::EndThread(thread_index)).unwrap();
 }
 
 fn main() {
@@ -96,43 +91,38 @@ fn main() {
         return;
     };
 
-    println!("n = {n}");
+    // Barrier to ensure all threads begin at the same time
     let b = Arc::new(Barrier::new(n + 1));
 
     // Signal to allow a thread to request the next command
     let (req_tx, req_rx) = channel::<Signal>();
-
-    // Signal to send next command
-    let (comm_tx, comm_rx) = sync_channel::<Option<String>>(5);
-    let comm_rx_am = Arc::new(Mutex::new(comm_rx));
+    // vec of signals to allow sending work to each thread
+    let mut tx_vec = vec![];
 
     let pool = ThreadPool::new(n);
     for i in 0..n {
         let b_local = b.clone();
         let req_tx_local = req_tx.clone();
-        let comm_rx_am_local = comm_rx_am.clone();
-        pool.execute(move || thread_function(i, b_local, req_tx_local, comm_rx_am_local));
+        let (comm_tx, comm_rx) = channel::<Option<String>>();
+        tx_vec.push(comm_tx);
+        pool.execute(move || thread_function(i, b_local, req_tx_local, comm_rx));
     }
     // begin ingesting stdin
     let mut command_source = stdin().lines().filter_map(|l| l.ok());
+    // unblock barrier
     b.wait();
     loop {
         match req_rx.recv() {
-            Ok(signal) => {
-                println!("signal: {signal:?}");
-                match signal {
-                    Signal::NextCommand => {
-                        let next_command = command_source.next();
-                        println!("next_command: {next_command:?}");
-                        comm_tx.send(next_command).unwrap();
-                    }
-                    Signal::EndThread => {
-                        if pool.active_count() == 0 {
-                            break;
-                        }
+            Ok(signal) => match signal {
+                Signal::NextCommand(index) => {
+                    tx_vec[index].send(command_source.next()).unwrap();
+                }
+                Signal::EndThread(_index) => {
+                    if pool.active_count() == 0 {
+                        break;
                     }
                 }
-            }
+            },
             Err(e) => {
                 panic!("Error: {e}");
             }
